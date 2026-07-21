@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # bridge/hooks/pretooluse.py — dünn, zustandslos, fail-safe ask
 import json, os, socket, sys
+try:
+    from ._paths import socket_path
+except ImportError:  # Claude executes this hook file directly.
+    from _paths import socket_path
 
-SOCK = os.path.expanduser("~/Documents/web/uconsole-companion-bridge/.run/bridge.sock")
+SOCK = socket_path()
 HINT_MAX = 120
 
 

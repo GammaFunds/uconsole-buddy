@@ -1,5 +1,8 @@
 import asyncio
-from bridge.daemon import Bridge
+import json
+
+from bridge.ble_central import BleCentral
+from bridge.daemon import Bridge, _make_handler
 from bridge.protocol import parse_permission  # noqa
 
 def run(coro): return asyncio.run(coro)
@@ -47,6 +50,156 @@ def test_stale_permission_ignored():
     assert run(scenario()) == "ask"   # nur die falsche id kam → Timeout → ask
 
 
+def test_duplicate_response_after_resolution_is_ignored():
+    async def scenario():
+        b, _ = make_bridge()
+        task = asyncio.create_task(b.request_approval("r-dup", "Bash", "x", timeout=5))
+        await asyncio.sleep(0)
+        b.on_ble_line('{"cmd":"permission","id":"r-dup","decision":"once"}')
+        assert await task == "allow"
+        b.on_ble_line('{"cmd":"permission","id":"r-dup","decision":"deny"}')
+        assert not b._pending
+    run(scenario())
+
+
+def test_concurrent_approval_falls_back_without_second_prompt():
+    async def scenario():
+        b, sent = make_bridge()
+        first = asyncio.create_task(b.request_approval("r-first", "Bash", "x", timeout=5))
+        await asyncio.sleep(0)
+        before = len(sent)
+        assert await b.request_approval("r-second", "Bash", "y", timeout=5) == "ask"
+        assert len(sent) == before
+        b.on_ble_line('{"cmd":"permission","id":"r-first","decision":"deny"}')
+        assert await first == "deny"
+    run(scenario())
+
+
+def test_ble_disconnect_fails_pending_without_allowing():
+    async def scenario():
+        b, _ = make_bridge()
+        task = asyncio.create_task(b.request_approval("r-disconnect", "Bash", "x", timeout=5))
+        await asyncio.sleep(0)
+        b.fail_pending()
+        assert await task == "ask"
+        b.on_ble_line('{"cmd":"permission","id":"r-disconnect","decision":"once"}')
+        assert not b._pending
+    run(scenario())
+
+
+def test_unknown_device_decision_never_allows():
+    async def scenario():
+        b, _ = make_bridge()
+        task = asyncio.create_task(b.request_approval("r-unknown", "Bash", "x", timeout=5))
+        await asyncio.sleep(0)
+        b.on_ble_line('{"cmd":"permission","id":"r-unknown","decision":"always"}')
+        assert await task == "ask"
+    run(scenario())
+
+
+def test_approval_allow_restores_retained_running_snapshot():
+    async def scenario():
+        b, sent = make_bridge()
+        hud = {"model": "gpt-5.4", "project": "gerald"}
+        await b.push_event(state="running", msg="working", entry="12:00 Bash", hud=hud)
+
+        task = asyncio.create_task(b.request_approval("r-restore", "Bash", "pytest -q", timeout=5))
+        await asyncio.sleep(0)
+        b.on_ble_line('{"cmd":"permission","id":"r-restore","decision":"once"}')
+        assert await task == "allow"
+
+        snapshots = [json.loads(line) for line in sent]
+        assert [snapshot["state"] for snapshot in snapshots[-2:]] == ["waiting", "running"]
+        assert snapshots[-1]["entries"] == ["12:00 Bash"]
+        assert snapshots[-1]["hud"] == hud
+        assert snapshots[-1]["prompt"] is None
+        assert snapshots[-1]["waiting"] == 0
+
+    run(scenario())
+
+
+def test_approval_deny_and_fallback_restore_retained_running_snapshot():
+    async def scenario(decision):
+        b, sent = make_bridge()
+        hud = {"model": "gpt-5.4", "project": "gerald"}
+        await b.push_event(state="running", msg="working", entry="12:00 Bash", hud=hud)
+
+        task = asyncio.create_task(b.request_approval("r-restore", "Bash", "pytest -q", timeout=0.02))
+        await asyncio.sleep(0)
+        if decision is not None:
+            b.on_ble_line(
+                json.dumps({"cmd": "permission", "id": "r-restore", "decision": decision})
+            )
+        result = await task
+
+        snapshot = json.loads(sent[-1])
+        assert result == ("deny" if decision == "deny" else "ask")
+        assert snapshot["state"] == "running"
+        assert snapshot["entries"] == ["12:00 Bash"]
+        assert snapshot["hud"] == hud
+        assert snapshot["prompt"] is None
+        assert snapshot["waiting"] == 0
+
+    run(scenario("deny"))
+    run(scenario(None))
+
+
+def test_approval_while_ble_already_disconnected_immediately_asks():
+    async def scenario():
+        central = BleCentral.__new__(BleCentral)
+        central._client = None
+        central._connected = False
+        b = Bridge(central.send_line)
+
+        result = await asyncio.wait_for(
+            b.request_approval("r-offline", "Bash", "pytest -q", timeout=5),
+            timeout=0.2,
+        )
+        assert result == "ask"
+        assert not b._pending
+
+        central._connected = True
+        b.on_ble_line('{"cmd":"permission","id":"r-offline","decision":"once"}')
+        assert not b._pending
+
+    run(scenario())
+
+
+def test_approval_client_disconnect_cancels_visible_prompt(monkeypatch):
+    class Reader:
+        async def readline(self):
+            return b'{"type":"approve","id":"r-cancel","tool":"Bash","hint":"x"}\n'
+
+        async def read(self, _size):
+            await asyncio.sleep(0)
+            return b""
+
+    class Writer:
+        def __init__(self):
+            self.data = b""
+            self.closed = False
+
+        def write(self, data):
+            self.data += data
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        b, sent = make_bridge()
+        writer = Writer()
+        monkeypatch.setattr("bridge.daemon.APPROVE_TIMEOUT", 5)
+        await _make_handler(b)(Reader(), writer)
+        assert writer.closed
+        assert writer.data == b""
+        assert not b._pending
+        assert any('"waiting": 0' in snapshot for snapshot in sent)
+    run(scenario())
+
+
 def test_push_status_sends_when_idle():
     async def scenario():
         b, sent = make_bridge()
@@ -68,8 +221,6 @@ def test_push_status_skips_during_approval():
         await task
     run(scenario())
 
-
-import json
 
 def test_push_event_sets_state_and_entry():
     async def scenario():

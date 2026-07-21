@@ -1,13 +1,12 @@
-# Setup — Gerald (uConsole Claude Buddy)
+# Setup — Gerald (uConsole Claude & Codex Buddy)
 
 Get Gerald running end to end. Two machines are involved:
 
 - **Device** — the BLE peripheral that shows the face (a uConsole / Raspberry Pi CM4, or any Linux box with BlueZ). Code in `device/`.
-- **Bridge host** — where you run Claude Code (macOS or Linux). Runs the BLE daemon + the hook scripts. Code in `bridge/`.
+- **Bridge host** — where you run Claude Code or Codex CLI (macOS or Linux). Runs the BLE daemon + the hook scripts. Code in `bridge/`.
 
-> ⚠️ **Paths are hardcoded.** Several files pin the author's home path
-> (`/Users/nikolaibockholt/Documents/web/uconsole-companion-bridge/…`). Before anything
-> works on your machine, fix them (see [Adjust the paths](#adjust-the-paths)).
+The Unix socket defaults to `~/.uconsole-buddy/run/bridge.sock`. Set
+`UCONSOLE_BRIDGE_SOCK` before starting the daemon and agent if you need a different path.
 
 ---
 
@@ -67,7 +66,9 @@ disconnect callback) triggers an automatic reconnect loop — no manual restart 
 
 ---
 
-## 3. Wire up the Claude Code hooks
+## 3. Wire up an agent
+
+### Claude Code
 
 The buddy reacts to your sessions through Claude Code **hooks**. Merge the hooks from
 `bridge/settings-snippet.json` into your project's `.claude/settings.json` (or your user
@@ -93,17 +94,65 @@ behaves normally. Start the daemon **before** `claude`.
 
 ---
 
-## 4. Adjust the paths
+### Codex CLI
 
-The unix socket and the hook command paths are hardcoded. Change these to your clone:
+Codex support uses the stable lifecycle-hook surface available in the normal TUI; it does
+not start app-server or replace the Codex frontend. The checked-in example was verified
+against the locally generated `codex-cli 0.144.6` hook schemas.
 
-- `bridge/bridge/daemon.py` — `SOCK = …/.run/bridge.sock`
-- `bridge/bridge/hooks/_send.py` — `SOCK`
-- `bridge/bridge/hooks/pretooluse.py` — `SOCK`
-- `bridge/settings-snippet.json` — every `command` path
+1. Copy `bridge/codex/hooks.json` to your project's `.codex/hooks.json`, or merge its event
+   groups into an existing hook file.
+2. Replace `/absolute/path/to/uconsole-buddy` in every command with this clone's absolute path.
+3. Start the Gerald bridge daemon, run `codex`, then use `/hooks` to review and trust the
+   exact project hook definitions. Codex skips untrusted hooks.
 
-Keep the socket path identical in the daemon and all hook scripts (that's how they find each
-other).
+The adapter maps only signals defined by the supported hook schemas:
+
+| Codex hook | Gerald effect |
+|------------|---------------|
+| `SessionStart` (`startup`, `resume`, `clear`) | initial `idle` + model/project HUD |
+| `UserPromptSubmit` | `thinking` (prompt text is discarded) |
+| `PreToolUse` | `running` + sanitized, maximum-120-character activity line |
+| `PermissionRequest` | eligible short Bash requests show `waiting`; `Y` allows once, `N` denies once |
+| `Stop` | `done`, then the existing daemon decays to `idle` |
+
+Physical Codex approval is available only when the request is Bash, authoritative `session_id`
+and `turn_id` values exist, and the complete command can be rendered safely and fits the
+46-character device approval display. All other requests fall back to Codex's native approval
+handling.
+
+Approval IDs bind the Codex `session_id` and `turn_id` plus the unique hook process. Only
+one Gerald approval can be visible at a time. A stale or duplicate device response is ignored;
+a concurrent request, timeout, bridge failure, BLE disconnect, or canceled hook connection
+also falls back to native approval. No session or persistent allow choice is returned.
+
+#### Activity feed
+
+The activity feed is a privacy-bounded summary only. It does not send arbitrary command
+arguments, prompts, assistant responses, tool output, file contents, or environment values.
+Bash feed entries expose only a command name and a small allow-list of non-sensitive flags;
+patch entries expose only the affected basename.
+
+#### Physical approval
+
+For an eligible short Bash command, the complete command is intentionally sent to Gerald
+because the human must see the exact action before approving it.
+
+Current Codex-hook limitations are deliberate: hooks provide no reliable context percentage or
+account usage-limit values, and no distinct turn-failure or cancellation event. Therefore the
+Codex path leaves context/usage HUD fields empty and does not fabricate `error` or a cancellation
+state. Hosted tools that do not emit `PreToolUse` also cannot appear in the live feed.
+
+## 4. Configure the socket and command paths
+
+The daemon and both agent adapters use this resolution order:
+
+1. `UCONSOLE_BRIDGE_SOCK`, with `~` expansion, when set.
+2. `~/.uconsole-buddy/run/bridge.sock` otherwise.
+
+Keep the environment override identical for the daemon and agent process. Claude's
+`bridge/settings-snippet.json` and Codex's `bridge/codex/hooks.json` still contain example
+absolute command paths; replace those with the path to your clone.
 
 ---
 
@@ -168,7 +217,8 @@ appliance — change that line to switch your device permanently. Strings live i
 
 ## Known limitations
 
-- Paths hardcoded (see step 4).
-- `error` state is defined but no hook emits it yet (dead path for now).
+- Hook command paths in the example JSON must be adjusted to the clone location.
+- Claude and Codex hooks currently expose no reliable event that drives `error`.
 - Token counters are always `0` (Claude Code hook payloads aren't wired to real usage yet).
+- Codex lifecycle hooks expose model/project but not context percentage or account usage limits.
 - Kiosk config lives under `~/.config` on the device, outside this repo.

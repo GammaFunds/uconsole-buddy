@@ -3,7 +3,6 @@ import asyncio
 from collections import deque
 from typing import Awaitable, Callable
 from .protocol import (
-    build_cleared_snapshot,
     build_prompt_snapshot,
     build_snapshot,
     decision_to_hook,
@@ -12,7 +11,7 @@ from .protocol import (
 
 
 class Bridge:
-    def __init__(self, send_snapshot: Callable[[str], Awaitable[None]]):
+    def __init__(self, send_snapshot: Callable[[str], Awaitable[bool | None]]):
         self._send = send_snapshot
         self._pending: dict[str, asyncio.Future] = {}
         self._state = "idle"
@@ -22,11 +21,17 @@ class Bridge:
         self._idle_task = None
 
     async def request_approval(self, req_id: str, tool: str, hint: str, timeout: float) -> str:
+        # Gerald has one approval overlay. Concurrent requests fall through to the
+        # agent's native prompt instead of hiding or queueing an unresolved request.
+        if self._pending:
+            return "ask"
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
         try:
-            await self._send(build_prompt_snapshot(req_id, tool, hint))
+            delivered = await self._send(build_prompt_snapshot(req_id, tool, hint))
+            if delivered is False:
+                return "ask"
             try:
                 return await asyncio.wait_for(fut, timeout=timeout)
             except asyncio.TimeoutError:
@@ -34,7 +39,7 @@ class Bridge:
         finally:
             self._pending.pop(req_id, None)
             try:
-                await self._send(build_cleared_snapshot())
+                await self._send(self._build_state_snapshot())
             except Exception:
                 pass
 
@@ -106,9 +111,10 @@ class Bridge:
 import json, logging, os
 from pathlib import Path
 from .ble_central import BleCentral
+from .hooks._paths import socket_path
 
 APPROVE_TIMEOUT = 100.0
-SOCK = Path(os.path.expanduser("~/Documents/web/uconsole-companion-bridge/.run/bridge.sock"))
+SOCK = Path(socket_path())
 logging.basicConfig(filename="bridge.log", level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
 
@@ -119,8 +125,18 @@ def _make_handler(bridge: "Bridge"):
             raw = await reader.readline()
             req = json.loads(raw.decode("utf-8"))
             if req.get("type") == "approve":
-                decision = await bridge.request_approval(
-                    req["id"], req.get("tool", "?"), req.get("hint", ""), APPROVE_TIMEOUT)
+                approval = asyncio.create_task(bridge.request_approval(
+                    req["id"], req.get("tool", "?"), req.get("hint", ""), APPROVE_TIMEOUT))
+                disconnected = asyncio.create_task(reader.read(1))
+                done, _ = await asyncio.wait(
+                    (approval, disconnected), return_when=asyncio.FIRST_COMPLETED)
+                if disconnected in done:
+                    approval.cancel()
+                    await asyncio.gather(approval, return_exceptions=True)
+                    return
+                disconnected.cancel()
+                await asyncio.gather(disconnected, return_exceptions=True)
+                decision = approval.result()
             elif req.get("type") == "status":
                 await bridge.push_event(state=req.get("state"),
                                         msg=req.get("msg") if "msg" in req else None,

@@ -79,20 +79,22 @@ class BleCentral:
                 log.info("reconnect failed: %s", e)
                 attempt += 1
 
-    async def send_line(self, line: str) -> None:
+    async def send_line(self, line: str) -> bool:
         if self._client is None or not self._connected:
-            return  # nicht verbunden — Reconnect läuft; Snapshot verwerfen statt crashen
+            return False  # nicht verbunden — Prompt kann nicht zugestellt werden
         data = line.encode("utf-8")
         mtu = getattr(self._client, "mtu_size", 23) or 23
         try:
             for chunk in chunk_for_mtu(data, mtu):
                 await self._client.write_gatt_char(NUS_RX, chunk, response=False)
                 await asyncio.sleep(0.01)
+            return True
         except Exception as e:
             # Toter Link: Send scheitert oft, BEVOR bleaks disconnected_callback feuert.
             # Selbst als Disconnect behandeln → Reconnect-Loop anwerfen.
             log.info("send failed (%s) — treating as disconnect", e)
             self._trigger_reconnect()
+            return False
 
     async def disconnect(self) -> None:
         if self._reconnect_task is not None:

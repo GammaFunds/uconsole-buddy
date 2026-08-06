@@ -3,13 +3,12 @@
 
 API-Hinweis: die installierte `bluez-peripheral`-Version (0.1.7) baut auf
 `dbus_next` (nicht `dbus_fast`!) und exportiert `get_message_bus()` direkt aus
-`bluez_peripheral.util`. Adapter-Objekte kommen aus `Adapter.get_all()` /
-`Adapter.get_first()` -- letzteres liest den ERSTEN Knoten unter `/org/bluez`,
-was auf diesem Gerät `hci1` sein kann (bluetoothctl-Default, aber DOWN +
-soft-blocked). Deshalb wird der Adapter hier hart per Adresse ausgewählt.
+`bluez_peripheral.util`. Adapter werden hier aus BlueZs verwalteten Objekten
+gefiltert und anschließend hart per Adresse ausgewählt.
 """
 import asyncio
 import logging
+import os
 from typing import Callable, Optional
 
 from bluez_peripheral.gatt.service import Service
@@ -25,6 +24,9 @@ NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Mac -> Gerät (write)
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Gerät -> Mac (notify)
 ADAPTER_ADDR = "2C:CF:67:FE:1E:1D"  # hci0 onboard Cypress -- HART gepinnt
+ADAPTER_ADDR_ENV = "GERALD_BT_ADAPTER_ADDR"
+ADAPTER_INTERFACE = "org.bluez.Adapter1"
+OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
 ADVERT_PATH = "/com/spacecheese/bluez_peripheral/advert0"  # bluez_peripheral-Default, explizit gehalten für Re-Advertise
 
 
@@ -60,7 +62,7 @@ class NusPeripheral:
     def __init__(self, device_name: str, on_line: Callable[[str], None],
                  adapter_addr: str = ADAPTER_ADDR):
         self.device_name = device_name
-        self.adapter_addr = adapter_addr
+        self.adapter_addr = os.environ.get(ADAPTER_ADDR_ENV) or adapter_addr
         self._svc = _NusService(on_line)
         self._bus = None  # dbus_next.aio.MessageBus, via get_message_bus()
         self._adapter: Optional[Adapter] = None
@@ -80,19 +82,36 @@ class NusPeripheral:
         await self._watch_connections()
 
     @staticmethod
+    async def _enumerate_adapters(bus):
+        """Return Adapter objects only for managed objects exposing Adapter1."""
+        introspection = await bus.introspect("org.bluez", "/")
+        root = bus.get_proxy_object("org.bluez", "/", introspection)
+        om = root.get_interface(OBJECT_MANAGER_INTERFACE)
+        objects = await om.call_get_managed_objects()
+
+        adapters = []
+        for path, interfaces in objects.items():
+            if ADAPTER_INTERFACE not in interfaces:
+                continue
+            adapter_introspection = await bus.introspect("org.bluez", path)
+            proxy = bus.get_proxy_object("org.bluez", path, adapter_introspection)
+            adapters.append(Adapter(proxy))
+        return adapters
+
+    @staticmethod
     async def _select_adapter(bus, addr: str) -> Adapter:
         """Wählt den Adapter mit der gegebenen BT-Adresse explizit aus.
 
-        `Adapter.get_first()` verlässt sich auf die Knoten-Reihenfolge unter
-        `/org/bluez` -- auf diesem Gerät ist das nicht garantiert hci0. Wir
-        iterieren stattdessen alle Adapter und matchen per Adresse.
+        Die Kandidaten kommen ausschließlich aus verwalteten BlueZ-Objekten
+        mit `org.bluez.Adapter1`; die Auswahl bleibt adressbasiert.
         """
-        adapters = await Adapter.get_all(bus)
+        adapters = await NusPeripheral._enumerate_adapters(bus)
         for adapter in adapters:
             candidate_addr = await adapter.get_address()
-            if candidate_addr.upper() == addr.upper():
+            if candidate_addr.casefold() == addr.casefold():
                 return adapter
-        found = ", ".join([await a.get_address() for a in adapters]) or "keine"
+        found_addresses = [await adapter.get_address() for adapter in adapters]
+        found = ", ".join(found_addresses) or "keine"
         raise RuntimeError(
             f"Bluetooth-Adapter mit Adresse {addr} nicht gefunden (gefunden: {found}). "
             "Ist hci0 up? `hciconfig -a` prüfen."

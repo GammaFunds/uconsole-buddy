@@ -2,19 +2,96 @@
 import asyncio
 import logging
 import os
+import sys
 import time
+from collections.abc import Callable, Sequence
+from typing import TextIO
 
-from .ble_nus import NusPeripheral
-from .notify import NotifyDecider, play
-from .state import AppState
-from .ui import CompanionApp
-from .protocol import parse_message, build_permission, build_ack, build_status_ack
+from uconsole_mode import (
+    GeraldLifecycleBusy,
+    GeraldLifecycleLock,
+    GeraldLifecycleUnsafe,
+    GeraldLifecycleWitnessInvalid,
+    default_gerald_lifecycle_lock_path,
+    validate_gerald_runtime_lease,
+)
 
-logging.basicConfig(filename="companion.log", level=logging.INFO,
-                    format="%(asctime)s %(message)s")
 log = logging.getLogger("companion")
 
 BOOT = time.monotonic()
+
+
+def _load_application_symbols() -> None:
+    global NusPeripheral, NotifyDecider, play, AppState, CompanionApp
+    global parse_message, build_permission, build_ack, build_status_ack
+
+    from .ble_nus import NusPeripheral
+    from .notify import NotifyDecider, play
+    from .state import AppState
+    from .ui import CompanionApp
+    from .protocol import parse_message, build_permission, build_ack, build_status_ack
+
+
+def _configure_application_logging() -> None:
+    logging.basicConfig(filename="companion.log", level=logging.INFO,
+                        format="%(asctime)s %(message)s")
+
+
+def _run_application() -> int:
+    _configure_application_logging()
+    _load_application_symbols()
+    asyncio.run(Companion().run())
+    return 0
+
+
+class _ApplicationContractError(Exception):
+    pass
+
+
+def _write_entrypoint_diagnostic(stderr: TextIO, status: str, code: str) -> None:
+    stderr.write(f"GERALD_ENTRYPOINT status={status} code={code}\n")
+
+
+def _validated_application_result(result: int) -> int:
+    if type(result) is not int or not 0 <= result <= 255:
+        raise _ApplicationContractError
+    return result
+
+
+def _run_gerald_entrypoint(
+    *,
+    lock_factory: Callable[[], GeraldLifecycleLock],
+    application_runner: Callable[[], int],
+    stderr: TextIO,
+) -> int:
+    try:
+        lock = lock_factory()
+        with lock.runtime() as lease:
+            validate_gerald_runtime_lease(lease)
+            return _validated_application_result(application_runner())
+    except GeraldLifecycleBusy:
+        _write_entrypoint_diagnostic(stderr, "BUSY", "lifecycle_busy")
+        return 75
+    except (GeraldLifecycleUnsafe, GeraldLifecycleWitnessInvalid):
+        _write_entrypoint_diagnostic(stderr, "UNSAFE", "lifecycle_unsafe")
+        return 78
+    except KeyboardInterrupt:
+        _write_entrypoint_diagnostic(stderr, "INTERRUPTED", "keyboard_interrupt")
+        return 1
+    except _ApplicationContractError:
+        _write_entrypoint_diagnostic(stderr, "APPLICATION_ERROR", "application_contract")
+        return 1
+    except Exception:
+        _write_entrypoint_diagnostic(stderr, "APPLICATION_ERROR", "application_error")
+        return 1
+
+
+def _default_lock_factory() -> GeraldLifecycleLock:
+    expected_uid = os.geteuid()
+    return GeraldLifecycleLock(
+        expected_uid,
+        default_gerald_lifecycle_lock_path(expected_uid),
+    )
 
 
 class Companion:
@@ -100,9 +177,22 @@ class Companion:
         await self.app.run_async()
 
 
-def main() -> None:
-    asyncio.run(Companion().run())
+def main(argv: Sequence[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if (
+        not isinstance(args, Sequence)
+        or isinstance(args, (str, bytes, bytearray))
+        or any(not isinstance(arg, str) for arg in args)
+        or args
+    ):
+        _write_entrypoint_diagnostic(sys.stderr, "USAGE_ERROR", "usage")
+        return 64
+    return _run_gerald_entrypoint(
+        lock_factory=_default_lock_factory,
+        application_runner=_run_application,
+        stderr=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

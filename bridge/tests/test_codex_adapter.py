@@ -67,6 +67,14 @@ def test_patch_feed_uses_only_filename_not_contents():
     assert "SECRET" not in summary
 
 
+def test_apply_patch_command_key_summarizes_filename_not_contents():
+    patch = "*** Begin Patch\n*** Update File: bridge/codex/gerald.py\n@@\n-SECRET\n+TOP_SECRET\n*** End Patch"
+    summary = tool_summary("apply_patch", {"command": patch})
+    assert summary == "Edit: gerald.py"
+    assert "SECRET" not in summary
+    assert "TOP_SECRET" not in summary
+
+
 def test_bash_feed_redacts_environment_and_sensitive_arguments():
     command = "API_TOKEN=supersecret curl -H 'Authorization: Bearer hidden' https://private.example"
     summary = tool_summary("Bash", {"command": command})
@@ -167,6 +175,39 @@ def test_render_deceptive_or_unicode_bash_commands_cannot_allow():
         assert approval_hint(permission) is None
         assert handle_event(permission, client) is None
         assert client.approvals == []
+
+
+def test_permission_request_accepts_optional_text_description():
+    client = FakeClient("allow")
+    output = handle_event(event(
+        "PermissionRequest", tool_name="Bash",
+        tool_input={"command": "pytest -q", "description": "Run focused tests"}), client)
+    assert output["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    assert client.approvals[0][1] == "Bash"
+    assert client.approvals[0][2] == "pytest -q"
+
+
+def test_permission_request_accepts_null_description():
+    client = FakeClient("allow")
+    assert approval_hint(event(
+        "PermissionRequest", tool_name="Bash",
+        tool_input={"command": "pytest -q", "description": None})) == "pytest -q"
+
+
+def test_permission_request_unknown_extra_key_fails_closed():
+    client = FakeClient("allow")
+    assert handle_event(
+        event("PermissionRequest", tool_name="Bash",
+              tool_input={"command": "pytest -q", "unexpected": "value"}), client) is None
+    assert client.approvals == []
+
+
+def test_permission_request_non_string_non_null_description_fails_closed():
+    client = FakeClient("allow")
+    assert handle_event(
+        event("PermissionRequest", tool_name="Bash",
+              tool_input={"command": "pytest -q", "description": 123}), client) is None
+    assert client.approvals == []
 
 
 def test_non_bash_permission_falls_through_and_cannot_allow():

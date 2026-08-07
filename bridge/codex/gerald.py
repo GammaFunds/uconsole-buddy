@@ -60,7 +60,7 @@ def tool_summary(tool_name: object, tool_input: object) -> str:
     if name == "Bash":
         return _bash_summary(data.get("command", ""))
     if name == "apply_patch":
-        patch = data.get("patch", "")
+        patch = data.get("command", data.get("patch", ""))
         if isinstance(patch, str):
             for line in patch.splitlines():
                 match = _PATCH_PATH.match(line)
@@ -121,7 +121,10 @@ def approval_hint(event: dict) -> str | None:
     if event.get("tool_name") != "Bash":
         return None
     tool_input = event.get("tool_input")
-    if not isinstance(tool_input, dict) or set(tool_input) != {"command"}:
+    if not isinstance(tool_input, dict) or set(tool_input) - {"command", "description"}:
+        return None
+    description = tool_input.get("description", None)
+    if description is not None and not isinstance(description, str):
         return None
     return _normalize_approval_command(tool_input.get("command"))
 

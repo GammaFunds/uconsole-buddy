@@ -12,8 +12,12 @@ import socket
 import subprocess
 import sys
 import time
+try:
+    from .hooks._paths import socket_path
+except ImportError:  # Claude may execute this file directly rather than as a module.
+    from hooks._paths import socket_path
 
-SOCK = os.path.expanduser("~/Documents/web/uconsole-companion-bridge/.run/bridge.sock")
+SOCK = socket_path()
 USAGE_CACHE = os.path.expanduser("~/.claude/plugins/claude-hud/.usage-cache.json")
 STATE_FILE = "/tmp/gerald-hud-state.json"
 HEARTBEAT_S = 30.0

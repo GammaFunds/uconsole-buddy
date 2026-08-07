@@ -1,6 +1,6 @@
-# Gerald — uConsole Claude Buddy
+# Gerald — uConsole Claude & Codex Buddy
 
-**Gerald** is a physical desk companion that reacts to your [Claude Code](https://claude.com/claude-code) sessions. A handheld terminal (a [ClockworkPi uConsole](https://www.clockworkpi.com/uconsole), Raspberry Pi CM4) sits next to you and shows — as a big drawn face — what Claude is doing right now: thinking, working, waiting for you, done. It plays a chime when Claude needs your input, streams a live feed of the tool calls, and lets you approve/deny shell commands with a physical key press.
+**Gerald** is a physical desk companion that reacts to [Claude Code](https://claude.com/claude-code) and [Codex CLI](https://developers.openai.com/codex/cli/) sessions. A handheld terminal (a [ClockworkPi uConsole](https://www.clockworkpi.com/uconsole), Raspberry Pi CM4) sits next to you and shows — as a big drawn face — what the coding agent is doing right now: thinking, working, waiting for you, done. It plays a chime when the agent needs your input, streams a live tool feed, and lets you approve or deny eligible permission requests with a physical key press. Codex activity is privacy-bounded.
 
 It started as a client for Anthropic's official **Hardware Buddy** (BLE) reference and grew into a full terminal-driven buddy via Claude Code hooks.
 
@@ -24,29 +24,28 @@ It started as a client for Anthropic's official **Hardware Buddy** (BLE) referen
 
 - **Ambient mood** — a drawn face (eyebrows + eyes + mouth) morphs and re-colours per state: `idle` · `thinking` · `running` · `waiting` · `done` · `error`.
 - **Live activity feed** — the last few tool calls (`Bash: npm test`, `Edit: ui.py`, …).
-- **Sound notifications** — a bright chime when Claude needs you (`waiting`), a soft tone when it's `done`, a distinct tone on `error`. Mute with `m`.
-- **Physical approvals** — a `Bash` command awaiting permission takes over the screen; press `Y`/`N` on the device to allow/deny the real session.
+- **Sound notifications** — a bright chime when the agent needs you (`waiting`), a soft tone when it's `done`, a distinct tone on `error`. Mute with `m`.
+- **Physical approvals** — press `Y`/`N` to allow or deny an eligible request once. For Codex, this is limited to Bash requests with authoritative session/turn identity whose complete command is safe to render and fits the 46-character device limit. All other Codex requests use native approval.
 - **Full-screen kiosk** with a mood-coloured border and small animations (blinking, running bar, drifting `z z z`).
 - **Multilingual** — English (default) and German UI, switch with the `GERALD_LANG` env var.
-- **Session HUD** — model, context-window fill and usage limits (5h/7d + reset countdown) from the Claude Code statusline, mirrored on the device.
+- **Session HUD** — Claude provides model, context-window fill, and usage limits through its statusline integration. Codex hooks reliably provide model and project only.
 
 ## How it works
 
 ```
-Claude Code (hooks)                      Mac / Linux              uConsole (BLE peripheral)
- SessionStart / UserPromptSubmit
- PreToolUse(Bash) / PostToolUse(*)  -->  bridge daemon    --BLE-->  Textual kiosk UI
- Notification / Stop / SessionEnd        (bleak central,           (bluez-peripheral,
-                                          unix socket)              Nordic UART / NUS)
+Claude Code hooks ──┐                    Mac / Linux              uConsole (BLE peripheral)
+                    ├─ agent adapter ──> bridge daemon    --BLE-->  Textual kiosk UI
+Codex hooks ────────┘                    (unix socket,              (bluez-peripheral,
+                                          bleak central)             Nordic UART / NUS)
 ```
 
-Claude Code hooks fire on session events and send a tiny JSON line to the daemon's unix socket (fire-and-forget). The daemon holds one BLE connection to the device and pushes JSON snapshots (`state`, rolling `entries`, …) over **Nordic UART (NUS)**, one JSON object per line — the same protocol as [`anthropics/claude-desktop-buddy`](https://github.com/anthropics/claude-desktop-buddy). `PreToolUse(Bash)` round-trips: the device sends back a `permission` (`once`/`deny`) that becomes the hook's `allow`/`deny`.
+The agent-specific hooks send tiny JSON messages to the same daemon Unix socket. The daemon holds one BLE connection to the device and pushes JSON snapshots (`state`, rolling `entries`, …) over **Nordic UART (NUS)**, one JSON object per line — the same protocol as [`anthropics/claude-desktop-buddy`](https://github.com/anthropics/claude-desktop-buddy). Approval requests round-trip through the existing device `permission` (`once`/`deny`) message.
 
 ## Repo layout
 
 | Path | What |
 |------|------|
-| **`bridge/`** | Mac/Linux side: Claude Code hook scripts + the BLE daemon (central). |
+| **`bridge/`** | Mac/Linux side: Claude and Codex hook adapters + the BLE daemon (central). |
 | **`device/`** | uConsole side: the Textual kiosk UI + BLE peripheral. |
 | **`docs/`** | `SETUP.md` (getting started) + the original German design specs & plans. |
 
@@ -54,15 +53,15 @@ Both parts keep their own git history (imported via `git subtree`).
 
 ## Requirements
 
-- **Bridge host** (where you run Claude Code): macOS or Linux, Python 3, Bluetooth LE. Depends on `bleak`.
+- **Bridge host** (where you run Claude Code or Codex): macOS or Linux, Python 3, Bluetooth LE. Depends on `bleak`.
 - **Device**: a Linux box with BlueZ + a BLE adapter (built on a uConsole / Raspberry Pi CM4, Python 3.11). Depends on `bluez-peripheral`, `dbus-fast`, `textual`, `pyfiglet`. A Wayland compositor (labwc) for the kiosk look, but any terminal works for testing.
-- **Claude Code** ≥ v2.1.210 (hook `permissionDecision` contract).
+- **Claude Code** ≥ v2.1.210 (hook `permissionDecision` contract), or **Codex CLI** with stable lifecycle hooks and `PermissionRequest` support (verified with `codex-cli 0.144.6`).
 
 ## Quick start
 
 See **[docs/SETUP.md](docs/SETUP.md)** for the full walkthrough (device + bridge + wiring the hooks + kiosk + troubleshooting).
 
-> ⚠️ **Heads-up:** the socket path and the hook command paths are currently **hardcoded** to the author's home directory (`~/Documents/web/uconsole-companion-bridge/…`). You'll need to adjust them — SETUP.md lists exactly where.
+The bridge socket defaults to `~/.uconsole-buddy/run/bridge.sock`. Set `UCONSOLE_BRIDGE_SOCK` to override it; hook command paths still need to point at your clone.
 
 ## Credits
 

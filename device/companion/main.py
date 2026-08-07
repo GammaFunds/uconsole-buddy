@@ -2,19 +2,109 @@
 import asyncio
 import logging
 import os
+import sys
 import time
+from collections.abc import Callable, Sequence
+from typing import TextIO
 
-from .ble_nus import NusPeripheral
-from .notify import NotifyDecider, play
-from .state import AppState
-from .ui import CompanionApp
-from .protocol import parse_message, build_permission, build_ack, build_status_ack
+from uconsole_mode import (
+    GeraldLifecycleBusy,
+    GeraldLifecycleLock,
+    GeraldLifecycleUnsafe,
+    GeraldLifecycleWitnessInvalid,
+    default_gerald_lifecycle_lock_path,
+    validate_gerald_runtime_lease,
+)
 
-logging.basicConfig(filename="companion.log", level=logging.INFO,
-                    format="%(asctime)s %(message)s")
 log = logging.getLogger("companion")
 
 BOOT = time.monotonic()
+
+
+def _load_application_symbols() -> None:
+    global NusPeripheral, NotifyDecider, play, AppState, CompanionApp
+    global parse_message, build_permission, build_ack, build_status_ack
+
+    from .ble_nus import NusPeripheral
+    from .notify import NotifyDecider, play
+    from .state import AppState
+    from .ui import CompanionApp
+    from .protocol import parse_message, build_permission, build_ack, build_status_ack
+
+
+def _configure_application_logging() -> None:
+    logging.basicConfig(filename="companion.log", level=logging.INFO,
+                        format="%(asctime)s %(message)s")
+
+
+def _run_application() -> int:
+    _configure_application_logging()
+    _load_application_symbols()
+
+    async def run_and_close() -> None:
+        companion = Companion()
+        try:
+            await companion.run()
+        except BaseException as run_error:
+            try:
+                await companion.aclose()
+            except BaseException as cleanup_error:
+                run_error.add_note(f"Companion cleanup failure: {cleanup_error!r}")
+            raise
+        await companion.aclose()
+
+    asyncio.run(run_and_close())
+    return 0
+
+
+class _ApplicationContractError(Exception):
+    pass
+
+
+def _write_entrypoint_diagnostic(stderr: TextIO, status: str, code: str) -> None:
+    stderr.write(f"GERALD_ENTRYPOINT status={status} code={code}\n")
+
+
+def _validated_application_result(result: int) -> int:
+    if type(result) is not int or not 0 <= result <= 255:
+        raise _ApplicationContractError
+    return result
+
+
+def _run_gerald_entrypoint(
+    *,
+    lock_factory: Callable[[], GeraldLifecycleLock],
+    application_runner: Callable[[], int],
+    stderr: TextIO,
+) -> int:
+    try:
+        lock = lock_factory()
+        with lock.runtime() as lease:
+            validate_gerald_runtime_lease(lease)
+            return _validated_application_result(application_runner())
+    except GeraldLifecycleBusy:
+        _write_entrypoint_diagnostic(stderr, "BUSY", "lifecycle_busy")
+        return 75
+    except (GeraldLifecycleUnsafe, GeraldLifecycleWitnessInvalid):
+        _write_entrypoint_diagnostic(stderr, "UNSAFE", "lifecycle_unsafe")
+        return 78
+    except KeyboardInterrupt:
+        _write_entrypoint_diagnostic(stderr, "INTERRUPTED", "keyboard_interrupt")
+        return 1
+    except _ApplicationContractError:
+        _write_entrypoint_diagnostic(stderr, "APPLICATION_ERROR", "application_contract")
+        return 1
+    except Exception:
+        _write_entrypoint_diagnostic(stderr, "APPLICATION_ERROR", "application_error")
+        return 1
+
+
+def _default_lock_factory() -> GeraldLifecycleLock:
+    expected_uid = os.geteuid()
+    return GeraldLifecycleLock(
+        expected_uid,
+        default_gerald_lifecycle_lock_path(expected_uid),
+    )
 
 
 class Companion:
@@ -25,6 +115,61 @@ class Companion:
         self._assets = os.path.join(os.path.dirname(__file__), "assets")
         self.app = CompanionApp(on_decision=self._on_decision, on_mute=self._toggle_mute)
         self._send_q: asyncio.Queue[str] = asyncio.Queue()
+        self._owned_tasks: list[asyncio.Task[None]] = []
+        self._closing = False
+        self._close_lock = asyncio.Lock()
+        self._close_attempted = False
+        self._close_error: BaseException | None = None
+        self._closed = False
+
+    def _create_owned_task(self, coroutine) -> asyncio.Task[None]:
+        if self._closing:
+            coroutine.close()
+            raise RuntimeError("Companion cleanup has started")
+        task = asyncio.create_task(coroutine)
+        self._owned_tasks.append(task)
+        return task
+
+    async def aclose(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            if self._close_attempted:
+                if self._close_error is not None:
+                    raise self._close_error
+                return
+
+            self._close_attempted = True
+            self._closing = True
+            failures: list[BaseException] = []
+            tasks = tuple(self._owned_tasks)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    if task in self._owned_tasks:
+                        self._owned_tasks.remove(task)
+
+            try:
+                await self.ble.aclose()
+            except BaseException as error:
+                failures.append(error)
+
+            if failures:
+                if all(isinstance(error, Exception) for error in failures):
+                    cleanup_error = ExceptionGroup("Companion cleanup failed", failures)
+                else:
+                    cleanup_error = BaseExceptionGroup("Companion cleanup failed", failures)
+                self._close_error = cleanup_error
+                raise cleanup_error
+            self._closed = True
 
     # ---- RX ----
     def _on_line(self, line: str) -> None:
@@ -95,14 +240,27 @@ class Companion:
     async def run(self) -> None:
         await self.ble.start()
         log.info("advertising as Claude-uConsole")
-        asyncio.create_task(self._tx_loop())
-        asyncio.create_task(self._tick_loop())
+        self._create_owned_task(self._tx_loop())
+        self._create_owned_task(self._tick_loop())
         await self.app.run_async()
 
 
-def main() -> None:
-    asyncio.run(Companion().run())
+def main(argv: Sequence[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if (
+        not isinstance(args, Sequence)
+        or isinstance(args, (str, bytes, bytearray))
+        or any(not isinstance(arg, str) for arg in args)
+        or args
+    ):
+        _write_entrypoint_diagnostic(sys.stderr, "USAGE_ERROR", "usage")
+        return 64
+    return _run_gerald_entrypoint(
+        lock_factory=_default_lock_factory,
+        application_runner=_run_application,
+        stderr=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

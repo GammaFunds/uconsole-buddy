@@ -3,13 +3,13 @@
 
 API-Hinweis: die installierte `bluez-peripheral`-Version (0.1.7) baut auf
 `dbus_next` (nicht `dbus_fast`!) und exportiert `get_message_bus()` direkt aus
-`bluez_peripheral.util`. Adapter-Objekte kommen aus `Adapter.get_all()` /
-`Adapter.get_first()` -- letzteres liest den ERSTEN Knoten unter `/org/bluez`,
-was auf diesem Gerät `hci1` sein kann (bluetoothctl-Default, aber DOWN +
-soft-blocked). Deshalb wird der Adapter hier hart per Adresse ausgewählt.
+`bluez_peripheral.util`. Adapter werden hier aus BlueZs verwalteten Objekten
+gefiltert und anschließend hart per Adresse ausgewählt.
 """
 import asyncio
+import inspect
 import logging
+import os
 from typing import Callable, Optional
 
 from bluez_peripheral.gatt.service import Service
@@ -25,6 +25,9 @@ NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Mac -> Gerät (write)
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Gerät -> Mac (notify)
 ADAPTER_ADDR = "2C:CF:67:FE:1E:1D"  # hci0 onboard Cypress -- HART gepinnt
+ADAPTER_ADDR_ENV = "GERALD_BT_ADAPTER_ADDR"
+ADAPTER_INTERFACE = "org.bluez.Adapter1"
+OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
 ADVERT_PATH = "/com/spacecheese/bluez_peripheral/advert0"  # bluez_peripheral-Default, explizit gehalten für Re-Advertise
 
 
@@ -60,39 +63,174 @@ class NusPeripheral:
     def __init__(self, device_name: str, on_line: Callable[[str], None],
                  adapter_addr: str = ADAPTER_ADDR):
         self.device_name = device_name
-        self.adapter_addr = adapter_addr
+        self.adapter_addr = os.environ.get(ADAPTER_ADDR_ENV) or adapter_addr
         self._svc = _NusService(on_line)
         self._bus = None  # dbus_next.aio.MessageBus, via get_message_bus()
+        self._bus_owned = False
         self._adapter: Optional[Adapter] = None
         self._advert: Optional[Advertisement] = None
+        self._service_registered = False
+        self._advertisement_registered = False
+        self._advertisement_path = None
+        self._close_lock = asyncio.Lock()
+        self._closed = False
+        self._closing = False
+        self._owned_tasks = []
+        self._callback_removers = []
         self._connected = False
 
     async def start(self) -> None:
-        self._bus = await get_message_bus()
-        self._adapter = await self._select_adapter(self._bus, self.adapter_addr)
-        bound_addr = await self._adapter.get_address()
-        log.info("bound to adapter %s (address %s)", self._adapter._proxy.path, bound_addr)
+        try:
+            self._bus = await get_message_bus()
+            self._bus_owned = True
+            self._adapter = await self._select_adapter(self._bus, self.adapter_addr)
+            bound_addr = await self._adapter.get_address()
+            log.info("bound to adapter %s (address %s)", self._adapter._proxy.path, bound_addr)
 
-        await self._svc.register(self._bus, adapter=self._adapter)
-        self._advert = Advertisement(self.device_name, [NUS_SERVICE], 0, 0)
-        await self._advert.register(self._bus, adapter=self._adapter, path=ADVERT_PATH)
+            await self._svc.register(self._bus, adapter=self._adapter)
+            self._service_registered = True
+            self._advert = Advertisement(self.device_name, [NUS_SERVICE], 0, 0)
+            self._advertisement_path = ADVERT_PATH
+            await self._advert.register(
+                self._bus, adapter=self._adapter, path=self._advertisement_path
+            )
+            self._advertisement_registered = True
 
-        await self._watch_connections()
+            await self._watch_connections()
+        except BaseException as startup_error:
+            try:
+                await self.aclose()
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    f"startup rollback cleanup failure: {cleanup_error!r}"
+                )
+            raise
+
+    def _create_owned_task(self, coroutine):
+        if self._closing:
+            raise RuntimeError("NusPeripheral cleanup has started")
+        task = asyncio.create_task(coroutine)
+        self._owned_tasks.append(task)
+        return task
+
+    async def _cleanup_owned_tasks(self, failures) -> None:
+        tasks = tuple(self._owned_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                if task in self._owned_tasks and task.done():
+                    self._owned_tasks.remove(task)
+
+    async def _remove_owned_callbacks(self, failures) -> None:
+        for record in tuple(self._callback_removers):
+            _, remover = record
+            try:
+                result = remover()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                self._callback_removers.remove(record)
+
+    async def aclose(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+
+            self._closing = True
+            failures = []
+
+            await self._cleanup_owned_tasks(failures)
+            await self._remove_owned_callbacks(failures)
+
+            if self._advertisement_registered:
+                try:
+                    if self._advertisement_path is None:
+                        raise RuntimeError("advertisement registration path unavailable")
+                    manager = self._adapter._proxy.get_interface(
+                        Advertisement._MANAGER_INTERFACE
+                    )
+                    await manager.call_unregister_advertisement(
+                        self._advertisement_path
+                    )
+                except Exception as exc:
+                    failures.append(exc)
+                else:
+                    self._advertisement_registered = False
+                    self._advertisement_path = None
+                    self._advert = None
+
+            if self._service_registered:
+                try:
+                    await self._svc.unregister()
+                except Exception as exc:
+                    failures.append(exc)
+                else:
+                    self._service_registered = False
+
+            if self._bus_owned and self._bus is not None:
+                try:
+                    self._bus.disconnect()
+                except Exception as exc:
+                    failures.append(exc)
+                else:
+                    self._bus_owned = False
+                    self._bus = None
+
+            if not (
+                self._owned_tasks
+                or self._callback_removers
+                or self._advertisement_registered
+                or self._service_registered
+                or self._bus_owned
+            ):
+                self._closed = True
+
+            if failures:
+                if all(isinstance(failure, Exception) for failure in failures):
+                    raise ExceptionGroup("NusPeripheral cleanup failed", failures)
+                raise BaseExceptionGroup("NusPeripheral cleanup failed", failures)
+
+    @staticmethod
+    async def _enumerate_adapters(bus):
+        """Return Adapter objects only for managed objects exposing Adapter1."""
+        introspection = await bus.introspect("org.bluez", "/")
+        root = bus.get_proxy_object("org.bluez", "/", introspection)
+        om = root.get_interface(OBJECT_MANAGER_INTERFACE)
+        objects = await om.call_get_managed_objects()
+
+        adapters = []
+        for path, interfaces in objects.items():
+            if ADAPTER_INTERFACE not in interfaces:
+                continue
+            adapter_introspection = await bus.introspect("org.bluez", path)
+            proxy = bus.get_proxy_object("org.bluez", path, adapter_introspection)
+            adapters.append(Adapter(proxy))
+        return adapters
 
     @staticmethod
     async def _select_adapter(bus, addr: str) -> Adapter:
         """Wählt den Adapter mit der gegebenen BT-Adresse explizit aus.
 
-        `Adapter.get_first()` verlässt sich auf die Knoten-Reihenfolge unter
-        `/org/bluez` -- auf diesem Gerät ist das nicht garantiert hci0. Wir
-        iterieren stattdessen alle Adapter und matchen per Adresse.
+        Die Kandidaten kommen ausschließlich aus verwalteten BlueZ-Objekten
+        mit `org.bluez.Adapter1`; die Auswahl bleibt adressbasiert.
         """
-        adapters = await Adapter.get_all(bus)
+        adapters = await NusPeripheral._enumerate_adapters(bus)
         for adapter in adapters:
             candidate_addr = await adapter.get_address()
-            if candidate_addr.upper() == addr.upper():
+            if candidate_addr.casefold() == addr.casefold():
                 return adapter
-        found = ", ".join([await a.get_address() for a in adapters]) or "keine"
+        found_addresses = [await adapter.get_address() for adapter in adapters]
+        found = ", ".join(found_addresses) or "keine"
         raise RuntimeError(
             f"Bluetooth-Adapter mit Adresse {addr} nicht gefunden (gefunden: {found}). "
             "Ist hci0 up? `hciconfig -a` prüfen."
@@ -110,12 +248,16 @@ class NusPeripheral:
         def handle_change(path: str, connected: bool) -> None:
             if self._connected == connected:
                 return
+            if self._closing:
+                return
             self._connected = connected
             log.info("central %s %s", path, "connected" if connected else "disconnected")
             if not connected:
-                asyncio.create_task(self._reassert_advertising())
+                self._create_owned_task(self._reassert_advertising())
 
         async def subscribe_device(path: str) -> None:
+            if self._closing:
+                return
             try:
                 dev_introspection = await self._bus.introspect("org.bluez", path)
             except Exception as e:  # device already gone
@@ -129,8 +271,13 @@ class NusPeripheral:
                     handle_change(path, bool(changed["Connected"].value))
 
             props.on_properties_changed(on_props_changed)
+            self._callback_removers.append(
+                ("device.properties_changed", lambda: props.off_properties_changed(on_props_changed))
+            )
 
         def on_interfaces_added(path, interfaces):
+            if self._closing:
+                return
             if not path.startswith(dev_prefix):
                 return
             dev = interfaces.get("org.bluez.Device1")
@@ -138,9 +285,12 @@ class NusPeripheral:
                 return
             if "Connected" in dev:
                 handle_change(path, bool(dev["Connected"].value))
-            asyncio.create_task(subscribe_device(path))
+            self._create_owned_task(subscribe_device(path))
 
         om.on_interfaces_added(on_interfaces_added)
+        self._callback_removers.append(
+            ("object_manager.interfaces_added", lambda: om.off_interfaces_added(on_interfaces_added))
+        )
 
         # Bereits existierende Device1-Objekte unter unserem Adapter erfassen
         # (z.B. bereits gebondete Geräte, die vor unserem Start verbunden waren).

@@ -61,13 +61,13 @@ nachsehen. Workaround: Daemon vorübergehend manuell aus einem bereits freigegeb
 starten, bis die TCC-Freigabe für den launchd-Kontext gesetzt ist.
 
 **Reihenfolge: Daemon vor `claude` starten.** Der `PreToolUse`-Hook verbindet sich pro
-Tool-Call neu zum Unix-Socket (`.run/bridge.sock`) und ist fail-safe auf `"ask"`, wenn der
+Tool-Call neu zum aufgelösten Unix-Socket (`UCONSOLE_BRIDGE_SOCK` oder
+`~/.uconsole-buddy/run/bridge.sock`) und ist fail-safe auf `"ask"`, wenn der
 Socket nicht existiert — läuft der Daemon nicht, bekommt man einfach den normalen nativen
 Terminal-Prompt statt eines Bridge-Fehlers. Für den vollen uConsole-Loop den Daemon (manuell
 oder via launchd) **vor** dem Start der `claude`-Session laufen haben.
 
 **Nur ein Central.** Siehe oben — Hardware Buddy (oder andere verbundene Apps) vorher trennen.
 
-**Socket-Pfad.** `$HOME/Documents/web/uconsole-companion-bridge/.run/bridge.sock`, Verzeichnis
-`0700`, Socket `0600`. Bei Berechtigungsproblemen `.run/` löschen — der Daemon legt Verzeichnis
-+ Socket beim Start neu an.
+**Socket-Pfad.** Zuerst `UCONSOLE_BRIDGE_SOCK` (mit `~`-Expansion), sonst
+`~/.uconsole-buddy/run/bridge.sock`. Daemon und Hooks müssen denselben Override verwenden.

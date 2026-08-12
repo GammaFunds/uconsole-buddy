@@ -218,3 +218,43 @@ def test_unknown_and_malformed_events_are_ignored():
 def test_main_malformed_input_never_breaks_codex(monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
     assert main() == 0
+
+def test_permission_request_description_metadata_is_physically_approvable():
+    client = FakeClient("deny")
+    command = "touch /etc/gerald-codex-return-probe"
+    permission = event(
+        "PermissionRequest",
+        tool_name="Bash",
+        tool_input={
+            "command": command,
+            "description": (
+                "May I run the exact requested command with permission "
+                "to write under /etc?"
+            ),
+        },
+    )
+
+    output = handle_event(permission, client)
+
+    assert len(client.approvals) == 1
+    assert client.approvals[0][1:] == ("Bash", command)
+    assert output["hookSpecificOutput"]["decision"] == {
+        "behavior": "deny",
+        "message": "Denied once from Gerald",
+    }
+
+
+def test_permission_request_description_metadata_with_unexpected_key_falls_through():
+    client = FakeClient("allow")
+    permission = event(
+        "PermissionRequest",
+        tool_name="Bash",
+        tool_input={
+            "command": "touch /etc/gerald-codex-return-probe",
+            "description": "May I run the exact requested command?",
+            "unexpected": "metadata",
+        },
+    )
+
+    assert handle_event(permission, client) is None
+    assert client.approvals == []

@@ -121,7 +121,17 @@ def approval_hint(event: dict) -> str | None:
     if event.get("tool_name") != "Bash":
         return None
     tool_input = event.get("tool_input")
-    if not isinstance(tool_input, dict) or set(tool_input) != {"command"}:
+    if not isinstance(tool_input, dict):
+        return None
+    keys = set(tool_input)
+    if keys == {"command"}:
+        pass
+    elif (
+        keys == {"command", "description"}
+        and isinstance(tool_input.get("description"), str)
+    ):
+        pass
+    else:
         return None
     return _normalize_approval_command(tool_input.get("command"))
 

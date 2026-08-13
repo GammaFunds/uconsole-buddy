@@ -32,6 +32,13 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {"type": "command", "command": "python3 /absolute/path/to/uconsole-buddy/bridge/codex/gerald.py", "timeout": 3}
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

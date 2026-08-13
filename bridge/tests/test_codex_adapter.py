@@ -1,6 +1,7 @@
 import io
 import json
 import socket
+from pathlib import Path
 
 from codex.gerald import (
     ACTIVITY_MAX,
@@ -259,3 +260,39 @@ def test_unknown_and_malformed_events_are_ignored():
 def test_main_malformed_input_never_breaks_codex(monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
     assert main() == 0
+
+
+
+def test_session_end_returns_to_idle_without_requiring_stop():
+    client = FakeClient()
+
+    handle_event(
+        event(
+            "PreToolUse",
+            tool_name="Bash",
+            tool_input={"command": "pytest -q"},
+        ),
+        client,
+    )
+    handle_event(
+        event(
+            "SessionEnd",
+            reason="normal session teardown",
+        ),
+        client,
+    )
+
+    assert [item["state"] for item in client.statuses] == ["running", "idle"]
+    assert client.statuses[-1]["msg"] == "idle"
+    assert client.statuses[-1]["hud"] == {
+        "model": "gpt-5.4",
+        "project": "gerald",
+    }
+
+
+def test_session_end_hook_uses_codex_supported_timeout():
+    hooks_path = Path(__file__).resolve().parents[1] / "codex" / "hooks.json"
+    hooks = json.loads(hooks_path.read_text())["hooks"]
+
+    assert hooks["SessionEnd"][0]["hooks"][0]["timeout"] == 3
+    assert hooks["Stop"][0]["hooks"][0]["timeout"] == 5

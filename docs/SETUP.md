@@ -115,6 +115,11 @@ The adapter maps only signals defined by the supported hook schemas:
 | `PreToolUse` | `running` + sanitized, maximum-120-character activity line |
 | `PermissionRequest` | eligible short Bash requests show `waiting`; `Y` allows once, `N` denies once |
 | `Stop` | `done`, then the existing daemon decays to `idle` |
+| `SessionEnd` | `idle` when Codex dispatches the lifecycle event |
+
+`SessionEnd` support is additive. Codex versions or surfaces that do not
+dispatch it reliably on TUI shutdown still fall back to the existing
+`Stop` -> `done` -> `idle` decay.
 
 Physical Codex approval is available only when the request is Bash, authoritative `session_id`
 and `turn_id` values exist, and the complete command can be rendered safely and fits the

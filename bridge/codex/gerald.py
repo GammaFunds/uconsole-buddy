@@ -205,6 +205,8 @@ def handle_event(event: object, client: BridgeClient) -> dict | None:
                 entry=feed_line(event.get("tool_name"), event.get("tool_input")), hud=hud)
     elif name == "Stop":
         _status(client, state="done", msg="done", hud=hud)
+    elif name == "SessionEnd":
+        _status(client, state="idle", msg="idle", hud=hud)
     elif name == "PermissionRequest":
         req_id = approval_id(event)
         hint = approval_hint(event)

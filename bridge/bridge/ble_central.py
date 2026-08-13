@@ -28,6 +28,7 @@ class BleCentral:
         self._client: BleakClient | None = None
         self._connected = False
         self._reconnect_task: asyncio.Task | None = None
+        self._tx_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         # Alten Client sauber loslassen, sonst hält macOS/CoreBluetooth ein stale Handle,
@@ -82,19 +83,25 @@ class BleCentral:
     async def send_line(self, line: str) -> bool:
         if self._client is None or not self._connected:
             return False  # nicht verbunden — Prompt kann nicht zugestellt werden
-        data = line.encode("utf-8")
-        mtu = getattr(self._client, "mtu_size", 23) or 23
-        try:
-            for chunk in chunk_for_mtu(data, mtu):
-                await self._client.write_gatt_char(NUS_RX, chunk, response=False)
-                await asyncio.sleep(0.01)
-            return True
-        except Exception as e:
-            # Toter Link: Send scheitert oft, BEVOR bleaks disconnected_callback feuert.
-            # Selbst als Disconnect behandeln → Reconnect-Loop anwerfen.
-            log.info("send failed (%s) — treating as disconnect", e)
-            self._trigger_reconnect()
-            return False
+
+        async with self._tx_lock:
+            # Der Zustand kann sich geändert haben, während wir auf einen
+            # vorherigen logischen BLE-Send gewartet haben.
+            if self._client is None or not self._connected:
+                return False
+            data = line.encode("utf-8")
+            mtu = getattr(self._client, "mtu_size", 23) or 23
+            try:
+                for chunk in chunk_for_mtu(data, mtu):
+                    await self._client.write_gatt_char(NUS_RX, chunk, response=False)
+                    await asyncio.sleep(0.01)
+                return True
+            except Exception as e:
+                # Toter Link: Send scheitert oft, BEVOR bleaks disconnected_callback feuert.
+                # Selbst als Disconnect behandeln → Reconnect-Loop anwerfen.
+                log.info("send failed (%s) — treating as disconnect", e)
+                self._trigger_reconnect()
+                return False
 
     async def disconnect(self) -> None:
         if self._reconnect_task is not None:

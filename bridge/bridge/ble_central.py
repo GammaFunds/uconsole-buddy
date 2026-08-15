@@ -27,6 +27,8 @@ class BleCentral:
         self._reasm = LineReassembler()
         self._client: BleakClient | None = None
         self._connected = False
+        self._validating_client: BleakClient | None = None
+        self._validation_disconnected = False
         self._reconnect_task: asyncio.Task | None = None
         self._tx_lock = asyncio.Lock()
 
@@ -34,19 +36,74 @@ class BleCentral:
         # Alten Client sauber loslassen, sonst hält macOS/CoreBluetooth ein stale Handle,
         # das den Reconnect in einen TimeoutError laufen lässt.
         if self._client is not None:
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
+            client = self._client
+            self._connected = False
+            await client.disconnect()
+            if self._client is client:
+                self._client = None
         dev = await BleakScanner.find_device_by_filter(
-            lambda d, ad: NUS_SERVICE.lower() in [u.lower() for u in (ad.service_uuids or [])],
-            timeout=15.0)
+            lambda _d, ad: NUS_SERVICE.lower()
+            in [u.lower() for u in (ad.service_uuids or [])],
+            timeout=15.0,
+        )
+        if dev is None:
+            # BlueZ can expose stale Device1.UUIDs for a paired device even
+            # while its current advertisement is NUS. Fall back to Gerald's
+            # configured advertised name; GATT/NUS setup below still has to
+            # succeed before the central is considered connected.
+            dev = await BleakScanner.find_device_by_filter(
+                lambda _d, ad: ad.local_name == self._name,
+                timeout=15.0,
+            )
         if dev is None:
             raise RuntimeError(f"kein Gerät mit NUS-Service {NUS_SERVICE} gefunden")
         self._client = BleakClient(dev, disconnected_callback=self._on_disc)
-        await self._client.connect()
-        await self._client.start_notify(NUS_TX, self._rx)
+        client = self._client
+        self._validating_client = client
+        self._validation_disconnected = False
+
+        try:
+            await client.connect()
+        except Exception:
+            self._validating_client = None
+            self._validation_disconnected = False
+            self._connected = False
+            raise
+
+        disconnected_during_connect = self._validation_disconnected
+        if disconnected_during_connect:
+            self._validating_client = None
+            self._validation_disconnected = False
+            if self._client is client:
+                self._client = None
+            self._connected = False
+            raise RuntimeError("BLE disconnected during client connect")
+
+        try:
+            await client.start_notify(NUS_TX, self._rx)
+        except Exception:
+            self._validating_client = None
+            self._validation_disconnected = False
+            self._connected = False
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            else:
+                if self._client is client:
+                    self._client = None
+            raise
+
+        disconnected_during_validation = self._validation_disconnected
+        self._validating_client = None
+        self._validation_disconnected = False
+
+        if disconnected_during_validation:
+            if self._client is client:
+                self._client = None
+            self._connected = False
+            raise RuntimeError("BLE disconnected during NUS setup")
+
         self._connected = True
 
     def _rx(self, _char, data: bytearray) -> None:
@@ -62,8 +119,21 @@ class BleCentral:
         if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.ensure_future(self._reconnect_loop())
 
-    def _on_disc(self, _client: BleakClient) -> None:
+    def _on_disc(self, client: BleakClient) -> None:
         """bleak-Callback bei ungeplantem Verbindungsverlust. Synchron — keine awaits hier."""
+        if client is not self._client:
+            return
+
+        # A real disconnect during GATT/NUS validation must invalidate this
+        # connect attempt, but caller-level retry owns recovery.
+        if client is self._validating_client:
+            self._validation_disconnected = True
+            return
+
+        # Setup cleanup callbacks are intentional and therefore inert.
+        if not self._connected:
+            return
+
         log.info("BLE disconnected")
         self._trigger_reconnect()
 

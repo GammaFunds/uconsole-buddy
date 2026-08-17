@@ -19,6 +19,7 @@ class Bridge:
         self._entries: deque[str] = deque(maxlen=8)
         self._hud: dict | None = None
         self._idle_task = None
+        self._active_prompt_snapshot: str | None = None
 
     async def request_approval(self, req_id: str, tool: str, hint: str, timeout: float) -> str:
         # Gerald has one approval overlay. Concurrent requests fall through to the
@@ -28,8 +29,10 @@ class Bridge:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
+        prompt_snapshot = build_prompt_snapshot(req_id, tool, hint)
+        self._active_prompt_snapshot = prompt_snapshot
         try:
-            delivered = await self._send(build_prompt_snapshot(req_id, tool, hint))
+            delivered = await self._send(prompt_snapshot)
             if delivered is False:
                 return "ask"
             try:
@@ -38,6 +41,7 @@ class Bridge:
                 return "ask"
         finally:
             self._pending.pop(req_id, None)
+            self._active_prompt_snapshot = None
             try:
                 await self._send(self._build_state_snapshot())
             except Exception:
@@ -95,6 +99,18 @@ class Bridge:
         if not self._pending:
             await self._send(self._build_state_snapshot())
 
+    async def push_heartbeat(self) -> None:
+        """Refresh device liveness without changing the retained Gerald state."""
+        if self._pending and self._active_prompt_snapshot is not None:
+            snapshot_data = json.loads(self._build_state_snapshot())
+            prompt_data = json.loads(self._active_prompt_snapshot)
+            for field in ("state", "running", "waiting", "msg", "prompt"):
+                snapshot_data[field] = prompt_data[field]
+            snapshot = json.dumps(snapshot_data) + "\n"
+        else:
+            snapshot = self._build_state_snapshot()
+        await self._send(snapshot)
+
     async def push_status(self, state: str, msg: str = "") -> None:
         """Rückwärtskompatibler Wrapper (alte Hooks + Tests)."""
         await self.push_event(state=state, msg=msg)
@@ -114,6 +130,7 @@ from .ble_central import BleCentral
 from .hooks._paths import socket_path
 
 APPROVE_TIMEOUT = 100.0
+HEARTBEAT_INTERVAL = 10.0
 SOCK = Path(socket_path())
 logging.basicConfig(filename="bridge.log", level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bridge")
@@ -159,6 +176,18 @@ def _make_handler(bridge: "Bridge"):
     return handle
 
 
+async def _heartbeat_loop(
+    bridge: "Bridge",
+    interval: float = HEARTBEAT_INTERVAL,
+) -> None:
+    while True:
+        try:
+            await bridge.push_heartbeat()
+        except Exception as e:
+            log.info("heartbeat send failed: %s", e)
+        await asyncio.sleep(interval)
+
+
 async def _serve(bridge: "Bridge"):
     SOCK.parent.mkdir(parents=True, exist_ok=True)
     if SOCK.exists():
@@ -167,8 +196,13 @@ async def _serve(bridge: "Bridge"):
     os.chmod(SOCK, 0o600)
     log.info("socket listening at %s", SOCK)
     print(f"socket listening at {SOCK}")
-    async with server:
-        await server.serve_forever()
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(bridge))
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
 async def _main():

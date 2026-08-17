@@ -64,6 +64,11 @@ unix socket):
 The daemon self-heals: if the device app restarts or the link drops, a failed send (or the
 disconnect callback) triggers an automatic reconnect loop — no manual restart needed.
 
+While connected, the daemon also refreshes Gerald's current snapshot every 10 seconds so
+the device's 30-second liveness timeout does not mark a healthy idle link offline. During
+an active approval, the heartbeat keeps the approval overlay while preserving the latest
+retained feed and HUD metadata.
+
 ---
 
 ## 3. Wire up an agent
@@ -94,17 +99,26 @@ behaves normally. Start the daemon **before** `claude`.
 
 ---
 
-### Codex CLI
+### Codex
 
-Codex support uses the stable lifecycle-hook surface available in the normal TUI; it does
-not start app-server or replace the Codex frontend. The checked-in example was verified
-against the locally generated `codex-cli 0.144.6` hook schemas.
+Codex support uses lifecycle hooks and does not start a separate app server or replace the
+Codex frontend. Choose the hook scope that matches how you want Gerald to behave:
 
-1. Copy `bridge/codex/hooks.json` to your project's `.codex/hooks.json`, or merge its event
-   groups into an existing hook file.
-2. Replace `/absolute/path/to/uconsole-buddy` in every command with this clone's absolute path.
-3. Start the Gerald bridge daemon, run `codex`, then use `/hooks` to review and trust the
-   exact project hook definitions. Codex skips untrusted hooks.
+1. For a Gerald buddy that follows your Codex activity across projects, including Codex
+   Desktop sessions, copy `bridge/codex/hooks.json` to `~/.codex/hooks.json`, or merge its
+   event groups into an existing user hook file.
+2. For one repository only, copy it to that repository's `.codex/hooks.json`, or merge its
+   event groups into the existing project hook file. Avoid installing the same Gerald hooks
+   at both user and project scope because Codex loads matching hooks from multiple sources.
+3. Replace `/absolute/path/to/uconsole-buddy` in every Gerald command with this clone's
+   absolute path.
+4. Start the Gerald bridge daemon, run `codex`, then use `/hooks` to inspect the loaded
+   source and review and trust the exact Gerald hook definitions. Changed hook definitions
+   must be reviewed again before they run.
+
+User hooks load from the active user configuration layer independently of project-local
+hook trust. Project-local hooks additionally depend on the repository's `.codex/` layer
+being trusted.
 
 The adapter maps only signals defined by the supported hook schemas:
 

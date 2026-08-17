@@ -3,6 +3,7 @@ import json
 
 from bridge.ble_central import BleCentral
 from bridge.daemon import Bridge, _make_handler
+import bridge.daemon as daemon_module
 from bridge.protocol import parse_permission  # noqa
 
 def run(coro): return asyncio.run(coro)
@@ -286,5 +287,131 @@ def test_hud_persists_across_events():
         assert json.loads(sent[0])["hud"] == {"model": "Fable 5", "ctx_pct": 12}
         assert json.loads(sent[1])["hud"] == {"model": "Fable 5", "ctx_pct": 12}  # bleibt erhalten
         assert json.loads(sent[1])["state"] == "running"
+
+    run(scenario())
+
+
+
+def test_heartbeat_refreshes_idle_liveness_snapshot():
+    async def scenario():
+        b, sent = make_bridge()
+
+        await b.push_heartbeat()
+
+        assert len(sent) == 1
+        snapshot = json.loads(sent[-1])
+        assert snapshot["state"] == "idle"
+        assert snapshot["total"] == 1
+        assert snapshot["running"] == 0
+        assert snapshot["waiting"] == 0
+        assert snapshot["prompt"] is None
+
+    run(scenario())
+
+
+def test_heartbeat_preserves_active_approval_prompt():
+    async def scenario():
+        b, sent = make_bridge()
+
+        approval = asyncio.create_task(
+            b.request_approval("r-heartbeat", "Bash", "pytest -q", timeout=5)
+        )
+        await asyncio.sleep(0)
+
+        original = json.loads(sent[-1])
+        assert original["state"] == "waiting"
+        assert original["prompt"]["id"] == "r-heartbeat"
+
+        await b.push_heartbeat()
+
+        heartbeat = json.loads(sent[-1])
+        assert heartbeat["state"] == "waiting"
+        assert heartbeat["waiting"] == 1
+        assert heartbeat["prompt"]["id"] == "r-heartbeat"
+        assert heartbeat["prompt"]["tool"] == "Bash"
+        assert heartbeat["prompt"]["hint"] == "pytest -q"
+
+        b.on_ble_line(
+            '{"cmd":"permission","id":"r-heartbeat","decision":"deny"}'
+        )
+        assert await approval == "deny"
+
+    run(scenario())
+
+
+def test_heartbeat_loop_sends_immediately_and_repeats_without_hook_events():
+    async def scenario():
+        b, sent = make_bridge()
+
+        task = asyncio.create_task(
+            daemon_module._heartbeat_loop(b, interval=0.01)
+        )
+        try:
+            await asyncio.sleep(0.025)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert len(sent) >= 2
+        snapshots = [json.loads(line) for line in sent]
+        assert all(snapshot["state"] == "idle" for snapshot in snapshots)
+        assert all(snapshot["prompt"] is None for snapshot in snapshots)
+
+    run(scenario())
+
+def test_heartbeat_preserves_current_metadata_during_active_approval():
+    async def scenario():
+        b, sent = make_bridge()
+
+        await b.push_event(
+            state="running",
+            msg="working",
+            entry="before",
+            hud={"model": "old"},
+        )
+
+        approval = asyncio.create_task(
+            b.request_approval(
+                "r-heartbeat-current",
+                "Bash",
+                "pytest -q",
+                timeout=5,
+            )
+        )
+        await asyncio.sleep(0)
+
+        original_prompt = json.loads(sent[-1])
+        assert original_prompt["state"] == "waiting"
+        assert original_prompt["prompt"]["id"] == "r-heartbeat-current"
+
+        before_suppressed_update = len(sent)
+
+        await b.push_event(
+            entry="after",
+            hud={"model": "new"},
+        )
+
+        # Approval overlay suppresses ordinary event transmission.
+        assert len(sent) == before_suppressed_update
+
+        await b.push_heartbeat()
+
+        heartbeat = json.loads(sent[-1])
+
+        # Approval remains authoritative...
+        assert heartbeat["state"] == "waiting"
+        assert heartbeat["waiting"] == 1
+        assert heartbeat["prompt"]["id"] == "r-heartbeat-current"
+        assert heartbeat["prompt"]["tool"] == "Bash"
+        assert heartbeat["prompt"]["hint"] == "pytest -q"
+
+        # ...but heartbeat must not roll retained metadata backwards.
+        assert heartbeat["entries"] == ["before", "after"]
+        assert heartbeat["hud"] == {"model": "new"}
+
+        b.on_ble_line(
+            '{"cmd":"permission","id":"r-heartbeat-current","decision":"deny"}'
+        )
+        assert await approval == "deny"
 
     run(scenario())
